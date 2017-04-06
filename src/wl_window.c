@@ -1250,6 +1250,11 @@ void _glfwPlatformResizeWindow(_GLFWwindow* window, int border)
                             wlBorder);
 }
 
+void _glfwPlatformDragWindow(_GLFWwindow* window)
+{
+    wl_shell_surface_move(window->wl.shellSurface, _glfw.wl.seat, _glfw.wl.pointerSerial);
+}
+
 void _glfwPlatformSetWindowMonitor(_GLFWwindow* window,
                                    _GLFWmonitor* monitor,
                                    int xpos, int ypos,
