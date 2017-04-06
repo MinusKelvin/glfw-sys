@@ -52,6 +52,7 @@
 #define _NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT   6
 #define _NET_WM_MOVERESIZE_SIZE_LEFT         7
 
+#define _NET_WM_MOVERESIZE_MOVE     8
 
 // Additional mouse button names for XButtonEvent
 #define Button6            6
@@ -2431,6 +2432,24 @@ void _glfwPlatformResizeWindow(_GLFWwindow* window, int border)
         case GLFW_WINDOW_BOTTOMRIGHT:
             xclient.data.l[2] = _NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT;
     }
+    xclient.data.l[3] = 0;
+    xclient.data.l[4] = 0;
+    XSendEvent(_glfw.x11.display, _glfw.x11.root, False, SubstructureRedirectMask | SubstructureNotifyMask, (XEvent *)&xclient);
+}
+
+void _glfwPlatformDragWindow(_GLFWwindow* window)
+{
+    XClientMessageEvent xclient;
+    memset(&xclient, 0, sizeof(XClientMessageEvent));
+    XUngrabPointer(_glfw.x11.display, 0);
+    XFlush(_glfw.x11.display);
+    xclient.type = ClientMessage;
+    xclient.window = window->x11.handle;
+    xclient.message_type = XInternAtom(_glfw.x11.display, "_NET_WM_MOVERESIZE", False);
+    xclient.format = 32;
+    xclient.data.l[0] = window->x11.xpos + window->x11.lastCursorPosX;
+    xclient.data.l[1] = window->x11.ypos + window->x11.lastCursorPosY;
+    xclient.data.l[2] = _NET_WM_MOVERESIZE_MOVE;
     xclient.data.l[3] = 0;
     xclient.data.l[4] = 0;
     XSendEvent(_glfw.x11.display, _glfw.x11.root, False, SubstructureRedirectMask | SubstructureNotifyMask, (XEvent *)&xclient);
