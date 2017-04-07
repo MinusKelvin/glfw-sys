@@ -1408,6 +1408,10 @@ void _glfwPlatformResizeWindow(_GLFWwindow* window, int border)
 {
 }
 
+void _glfwPlatformDragWindow(_GLFWwindow* window)
+{
+}
+
 void _glfwPlatformSetWindowMonitor(_GLFWwindow* window,
                                    _GLFWmonitor* monitor,
                                    int xpos, int ypos,
