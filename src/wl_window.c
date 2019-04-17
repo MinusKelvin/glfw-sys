@@ -156,6 +156,9 @@ static int createAnonymousFile(off_t size)
         fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
     }
     else
+#elif defined(SHM_ANON)
+    fd = shm_open(SHM_ANON, O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0)
 #endif
     {
         path = getenv("XDG_RUNTIME_DIR");
@@ -175,7 +178,12 @@ static int createAnonymousFile(off_t size)
             return -1;
     }
 
+#if defined(SHM_ANON)
+    // posix_fallocate does not work on SHM descriptors
+    ret = ftruncate(fd, size);
+#else
     ret = posix_fallocate(fd, 0, size);
+#endif
     if (ret != 0)
     {
         close(fd);
@@ -633,10 +641,17 @@ static void xdgToplevelHandleConfigure(void* data,
         _glfwInputWindowDamage(window);
     }
 
-    if (!window->wl.justCreated && !activated && window->autoIconify)
-        _glfwPlatformIconifyWindow(window);
+    if (window->wl.wasFullscreen && window->autoIconify)
+    {
+        if (!activated || !fullscreen)
+        {
+            _glfwPlatformIconifyWindow(window);
+            window->wl.wasFullscreen = GLFW_FALSE;
+        }
+    }
+    if (fullscreen && activated)
+        window->wl.wasFullscreen = GLFW_TRUE;
     _glfwInputWindowFocus(window, activated);
-    window->wl.justCreated = GLFW_FALSE;
 }
 
 static void xdgToplevelHandleClose(void* data,
@@ -779,7 +794,7 @@ static void setCursorImage(_GLFWwindow* window,
         cursorWayland->yhot = image->hotspot_y;
     }
 
-    wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.pointerSerial,
+    wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.serial,
                           surface,
                           cursorWayland->xhot / scale,
                           cursorWayland->yhot / scale);
@@ -905,7 +920,6 @@ int _glfwPlatformCreateWindow(_GLFWwindow* window,
                               const _GLFWctxconfig* ctxconfig,
                               const _GLFWfbconfig* fbconfig)
 {
-    window->wl.justCreated = GLFW_TRUE;
     window->wl.transparent = fbconfig->transparent;
 
     if (!createSurface(window, wndconfig))
@@ -1304,6 +1318,16 @@ void _glfwPlatformSetWindowOpacity(_GLFWwindow* window, float opacity)
 {
 }
 
+void _glfwPlatformSetRawMouseMotion(_GLFWwindow *window, GLFWbool enabled)
+{
+    // This is handled in relativePointerHandleRelativeMotion
+}
+
+GLFWbool _glfwPlatformRawMouseMotionSupported(void)
+{
+    return GLFW_TRUE;
+}
+
 void _glfwPlatformPollEvents(void)
 {
     handleEvents(0);
@@ -1423,13 +1447,24 @@ static void relativePointerHandleRelativeMotion(void* data,
                                                 wl_fixed_t dyUnaccel)
 {
     _GLFWwindow* window = data;
+    double xpos = window->virtualCursorPosX;
+    double ypos = window->virtualCursorPosY;
 
     if (window->cursorMode != GLFW_CURSOR_DISABLED)
         return;
 
-    _glfwInputCursorPos(window,
-                        window->virtualCursorPosX + wl_fixed_to_double(dxUnaccel),
-                        window->virtualCursorPosY + wl_fixed_to_double(dyUnaccel));
+    if (window->rawMouseMotion)
+    {
+        xpos += wl_fixed_to_double(dxUnaccel);
+        ypos += wl_fixed_to_double(dyUnaccel);
+    }
+    else
+    {
+        xpos += wl_fixed_to_double(dx);
+        ypos += wl_fixed_to_double(dy);
+    }
+
+    _glfwInputCursorPos(window, xpos, ypos);
 }
 
 static const struct zwp_relative_pointer_v1_listener relativePointerListener = {
@@ -1501,7 +1536,7 @@ static void lockPointer(_GLFWwindow* window)
     window->wl.pointerLock.relativePointer = relativePointer;
     window->wl.pointerLock.lockedPointer = lockedPointer;
 
-    wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.pointerSerial,
+    wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.serial,
                           NULL, 0, 0);
 }
 
@@ -1565,24 +1600,213 @@ void _glfwPlatformSetCursor(_GLFWwindow* window, _GLFWcursor* cursor)
     }
     else if (window->cursorMode == GLFW_CURSOR_HIDDEN)
     {
-        wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.pointerSerial,
-                              NULL, 0, 0);
+        wl_pointer_set_cursor(_glfw.wl.pointer, _glfw.wl.serial, NULL, 0, 0);
     }
 }
 
+static void dataSourceHandleTarget(void* data,
+                                   struct wl_data_source* dataSource,
+                                   const char* mimeType)
+{
+    if (_glfw.wl.dataSource != dataSource)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Unknown clipboard data source");
+        return;
+    }
+}
+
+static void dataSourceHandleSend(void* data,
+                                 struct wl_data_source* dataSource,
+                                 const char* mimeType,
+                                 int fd)
+{
+    const char* string = _glfw.wl.clipboardSendString;
+    size_t len = _glfw.wl.clipboardSendSize;
+    int ret;
+
+    if (_glfw.wl.dataSource != dataSource)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Unknown clipboard data source");
+        return;
+    }
+
+    if (!string)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Copy requested from an invalid string");
+        return;
+    }
+
+    if (strcmp(mimeType, "text/plain;charset=utf-8") != 0)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Wrong MIME type asked from clipboard");
+        close(fd);
+        return;
+    }
+
+    while (len > 0)
+    {
+        ret = write(fd, string, len);
+        if (ret == -1 && errno == EINTR)
+            continue;
+        if (ret == -1)
+        {
+            // TODO: also report errno maybe.
+            _glfwInputError(GLFW_PLATFORM_ERROR,
+                            "Wayland: Error while writing the clipboard");
+            close(fd);
+            return;
+        }
+        len -= ret;
+    }
+    close(fd);
+}
+
+static void dataSourceHandleCancelled(void* data,
+                                      struct wl_data_source* dataSource)
+{
+    wl_data_source_destroy(dataSource);
+
+    if (_glfw.wl.dataSource != dataSource)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Unknown clipboard data source");
+        return;
+    }
+
+    _glfw.wl.dataSource = NULL;
+}
+
+static const struct wl_data_source_listener dataSourceListener = {
+    dataSourceHandleTarget,
+    dataSourceHandleSend,
+    dataSourceHandleCancelled,
+};
+
 void _glfwPlatformSetClipboardString(const char* string)
 {
-    // TODO
-    _glfwInputError(GLFW_PLATFORM_ERROR,
-                    "Wayland: Clipboard setting not implemented yet");
+    if (_glfw.wl.dataSource)
+    {
+        wl_data_source_destroy(_glfw.wl.dataSource);
+        _glfw.wl.dataSource = NULL;
+    }
+
+    if (_glfw.wl.clipboardSendString)
+    {
+        free(_glfw.wl.clipboardSendString);
+        _glfw.wl.clipboardSendString = NULL;
+    }
+
+    _glfw.wl.clipboardSendString = strdup(string);
+    if (!_glfw.wl.clipboardSendString)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Impossible to allocate clipboard string");
+        return;
+    }
+    _glfw.wl.clipboardSendSize = strlen(string);
+    _glfw.wl.dataSource =
+        wl_data_device_manager_create_data_source(_glfw.wl.dataDeviceManager);
+    if (!_glfw.wl.dataSource)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Impossible to create clipboard source");
+        free(_glfw.wl.clipboardSendString);
+        return;
+    }
+    wl_data_source_add_listener(_glfw.wl.dataSource,
+                                &dataSourceListener,
+                                NULL);
+    wl_data_source_offer(_glfw.wl.dataSource, "text/plain;charset=utf-8");
+    wl_data_device_set_selection(_glfw.wl.dataDevice,
+                                 _glfw.wl.dataSource,
+                                 _glfw.wl.serial);
+}
+
+static GLFWbool growClipboardString(void)
+{
+    char* clipboard = _glfw.wl.clipboardString;
+
+    clipboard = realloc(clipboard, _glfw.wl.clipboardSize * 2);
+    if (!clipboard)
+    {
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Impossible to grow clipboard string");
+        return GLFW_FALSE;
+    }
+    _glfw.wl.clipboardString = clipboard;
+    _glfw.wl.clipboardSize = _glfw.wl.clipboardSize * 2;
+    return GLFW_TRUE;
 }
 
 const char* _glfwPlatformGetClipboardString(void)
 {
-    // TODO
-    _glfwInputError(GLFW_PLATFORM_ERROR,
-                    "Wayland: Clipboard getting not implemented yet");
-    return NULL;
+    int fds[2];
+    int ret;
+    size_t len = 0;
+
+    if (!_glfw.wl.dataOffer)
+    {
+        _glfwInputError(GLFW_FORMAT_UNAVAILABLE,
+                        "No clipboard data has been sent yet");
+        return NULL;
+    }
+
+    ret = pipe2(fds, O_CLOEXEC);
+    if (ret < 0)
+    {
+        // TODO: also report errno maybe?
+        _glfwInputError(GLFW_PLATFORM_ERROR,
+                        "Wayland: Impossible to create clipboard pipe fds");
+        return NULL;
+    }
+
+    wl_data_offer_receive(_glfw.wl.dataOffer, "text/plain;charset=utf-8", fds[1]);
+    close(fds[1]);
+
+    // XXX: this is a huge hack, this function shouldn’t be synchronous!
+    handleEvents(-1);
+
+    while (1)
+    {
+        // Grow the clipboard if we need to paste something bigger, there is no
+        // shrink operation yet.
+        if (len + 4096 > _glfw.wl.clipboardSize)
+        {
+            if (!growClipboardString())
+            {
+                close(fds[0]);
+                return NULL;
+            }
+        }
+
+        // Then read from the fd to the clipboard, handling all known errors.
+        ret = read(fds[0], _glfw.wl.clipboardString + len, 4096);
+        if (ret == 0)
+            break;
+        if (ret == -1 && errno == EINTR)
+            continue;
+        if (ret == -1)
+        {
+            // TODO: also report errno maybe.
+            _glfwInputError(GLFW_PLATFORM_ERROR,
+                            "Wayland: Impossible to read from clipboard fd");
+            close(fds[0]);
+            return NULL;
+        }
+        len += ret;
+    }
+    close(fds[0]);
+    if (len + 1 > _glfw.wl.clipboardSize)
+    {
+        if (!growClipboardString())
+            return NULL;
+    }
+    _glfw.wl.clipboardString[len] = '\0';
+    return _glfw.wl.clipboardString;
 }
 
 void _glfwPlatformGetRequiredInstanceExtensions(char** extensions)
